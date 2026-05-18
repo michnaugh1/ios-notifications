@@ -3,7 +3,11 @@ use bluer::Address;
 use clap::Parser;
 
 use ios_notificationsd::ancs;
+use ios_notificationsd::config::FilterConfig;
+use ios_notificationsd::filter::Filter;
 use ios_notificationsd::hid_bridge;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -43,7 +47,8 @@ async fn main() -> Result<()> {
     };
 
     loop {
-        let proc = ancs::AncsProcessor::new();
+        let filter = Arc::new(RwLock::new(Filter::new(FilterConfig::default())));
+        let proc = ancs::AncsProcessor::new(filter);
         if let Err(e) = proc.main_loop(args.device_addr, &adapter).await {
             log::error!("Error: {:?}", e);
         }

@@ -3,7 +3,7 @@
 //! Inherited from kmod-midori/ancs-linux @ 6883f2b with minor adaptations
 //! (will be extended for filtering in Task 6).
 
-use std::{collections::HashMap, io::Cursor};
+use std::{collections::HashMap, io::Cursor, sync::Arc};
 
 use ancs::{
     attributes::{
@@ -25,19 +25,36 @@ use bluer::{
 };
 use byteorder_pack::UnpackFrom;
 use futures::{pin_mut, StreamExt as _};
+use tokio::sync::RwLock;
+
+use crate::filter::Filter;
 
 pub const ANCS_SERVICE_UUID: Uuid = Uuid::from_u128(0x7905F431B5CE4E99A40F4B1E122D00D0);
 
 pub struct AncsProcessor {
     control_point: Option<Characteristic>,
     app_names: HashMap<String, String>,
+    filter: Arc<RwLock<Filter>>,
+    on_delivered: Box<dyn Fn(String, String) + Send + Sync>,
+    on_filtered: Box<dyn Fn(String, String) + Send + Sync>,
 }
 
 impl AncsProcessor {
-    pub fn new() -> Self {
+    pub fn new(filter: Arc<RwLock<Filter>>) -> Self {
+        Self::with_callbacks(filter, Box::new(|_, _| {}), Box::new(|_, _| {}))
+    }
+
+    pub fn with_callbacks(
+        filter: Arc<RwLock<Filter>>,
+        on_delivered: Box<dyn Fn(String, String) + Send + Sync>,
+        on_filtered: Box<dyn Fn(String, String) + Send + Sync>,
+    ) -> Self {
         Self {
             control_point: None,
             app_names: HashMap::new(),
+            filter,
+            on_delivered,
+            on_filtered,
         }
     }
 
@@ -150,39 +167,65 @@ impl AncsProcessor {
                 };
                 log::info!("Notif: {:?}", notif);
 
-                let mut app_id_to_query = None;
-                let mut desktop_notification = notify_rust::Notification::new();
+                let mut app_id_to_query: Option<String> = None;
+                let mut current_app_id: Option<String> = None;
+                let mut current_title: Option<String> = None;
+                let mut current_body: Option<String> = None;
+                let mut current_app_name_display: Option<String> = None;
+
                 for attr in notif.attribute_list {
                     match attr.id {
                         NotificationAttributeID::AppIdentifier => {
                             if let Some(id) = attr.value {
                                 if let Some(name) = self.app_names.get(&id) {
-                                    desktop_notification.appname(name);
+                                    current_app_name_display = Some(name.clone());
                                 } else {
-                                    desktop_notification.appname(&id);
-                                    app_id_to_query = Some(id);
+                                    current_app_name_display = Some(id.clone());
+                                    app_id_to_query = Some(id.clone());
                                 }
+                                current_app_id = Some(id);
                             }
                         }
                         NotificationAttributeID::Title => {
-                            if let Some(v) = attr.value {
-                                desktop_notification.summary(&v);
-                            }
+                            current_title = attr.value;
                         }
                         NotificationAttributeID::Message => {
-                            if let Some(v) = attr.value {
-                                desktop_notification.body(&v);
-                            }
+                            current_body = attr.value;
                         }
                         _ => {}
                     }
                 }
-                let handle = desktop_notification.show_async().await?;
-                log::info!(
-                    "Shown notification {} with desktop handle {}",
-                    notif.notification_uid,
-                    handle.id()
-                );
+
+                let app_id = current_app_id.as_deref().unwrap_or("unknown");
+                let title = current_title.clone().unwrap_or_default();
+
+                let pass = {
+                    let f = self.filter.read().await;
+                    f.should_show(app_id)
+                };
+
+                if !pass {
+                    log::info!("Filtered notification from {}", app_id);
+                    (self.on_filtered)(app_id.to_string(), title.clone());
+                } else {
+                    let mut desktop_notification = notify_rust::Notification::new();
+                    if let Some(name) = &current_app_name_display {
+                        desktop_notification.appname(name);
+                    }
+                    if let Some(t) = &current_title {
+                        desktop_notification.summary(t);
+                    }
+                    if let Some(b) = &current_body {
+                        desktop_notification.body(b);
+                    }
+                    let handle = desktop_notification.show_async().await?;
+                    log::info!(
+                        "Shown notification {} with desktop handle {}",
+                        notif.notification_uid,
+                        handle.id()
+                    );
+                    (self.on_delivered)(app_id.to_string(), title);
+                }
 
                 if let Some(app_id) = app_id_to_query {
                     log::info!("Querying app name for {}", app_id);
@@ -238,11 +281,5 @@ impl AncsProcessor {
                 .await?;
         }
         Ok(())
-    }
-}
-
-impl Default for AncsProcessor {
-    fn default() -> Self {
-        Self::new()
     }
 }
