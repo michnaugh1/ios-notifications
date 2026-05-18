@@ -13,6 +13,7 @@ use serde::Deserialize;
 pub struct Config {
     pub device: DeviceConfig,
     #[serde(default)]
+    #[allow(dead_code)]
     pub notifications: NotificationsConfig,
     #[serde(default)]
     pub filter: FilterConfig,

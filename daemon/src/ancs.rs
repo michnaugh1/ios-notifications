@@ -40,6 +40,7 @@ pub struct AncsProcessor {
 }
 
 impl AncsProcessor {
+    #[allow(dead_code)]
     pub fn new(filter: Arc<RwLock<Filter>>) -> Self {
         Self::with_callbacks(filter, Box::new(|_, _| {}), Box::new(|_, _| {}))
     }
