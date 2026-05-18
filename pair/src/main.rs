@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use bluer::{Adapter, Address, AdapterEvent, Device, Uuid};
+use bluer::adv::{Advertisement, Type as AdvType};
 use clap::Parser;
 use futures::{pin_mut, StreamExt};
 use tokio::time::timeout;
@@ -57,11 +58,21 @@ async fn run(args: &Args, config_path: &Path) -> Result<()> {
     println!("                              ✓ {} ({})", adapter.name(), addr);
 
     print!("[3/5] Making adapter discoverable for {}s…", args.timeout);
+    adapter.set_powered(true).await?;
     adapter.set_pairable(true).await?;
     adapter.set_pairable_timeout(args.timeout).await?;
     adapter.set_discoverable(true).await?;
     adapter.set_discoverable_timeout(args.timeout).await?;
-    adapter.set_powered(true).await?;
+    // set_discoverable only covers BR/EDR inquiry; BLE requires an active
+    // advertisement so iOS can find the adapter during scanning.
+    let adv = Advertisement {
+        advertisement_type: AdvType::Peripheral,
+        local_name: Some(adapter.name().to_string()),
+        discoverable: Some(true),
+        ..Default::default()
+    };
+    let _adv_handle = adapter.advertise(adv).await
+        .context("start BLE advertisement")?;
     println!("                ✓ Done");
 
     println!("\n        ── On your iPhone ──");
