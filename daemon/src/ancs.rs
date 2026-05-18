@@ -21,7 +21,7 @@ use ancs::{
 use anyhow::{bail, Result};
 use bluer::{
     gatt::remote::{Characteristic, CharacteristicWriteRequest},
-    Adapter, Address, DeviceEvent, DeviceProperty, Uuid,
+    Adapter, Address, Uuid,
 };
 use byteorder_pack::UnpackFrom;
 use futures::{pin_mut, StreamExt as _};
@@ -68,23 +68,12 @@ impl AncsProcessor {
         }
         log::info!("Device {} is connected", device_addr);
 
-        // iOS only exposes ANCS once the BLE connection is encrypted and GATT
-        // discovery is complete. Wait for ServicesResolved before querying —
-        // without this, services() hangs for ~2 minutes then finds nothing.
-        if !device.is_services_resolved().await? {
-            log::info!("Waiting for GATT services to resolve…");
-            let dev_events = device.events().await?;
-            pin_mut!(dev_events);
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-            loop {
-                match tokio::time::timeout_at(deadline, dev_events.next()).await {
-                    Ok(Some(DeviceEvent::PropertyChanged(DeviceProperty::ServicesResolved(true)))) => break,
-                    Ok(Some(_)) => continue,
-                    Ok(None) => bail!("device disconnected while waiting for services"),
-                    Err(_) => bail!("timed out waiting for GATT services to resolve"),
-                }
-            }
-        }
+        // When iOS connects to us (HID peripheral role), BlueZ has an HCI
+        // connection but hasn't run GATT service discovery or requested
+        // encryption. device.connect() does both — it blocks until GATT
+        // discovery completes and ServicesResolved becomes true.
+        log::info!("Triggering GATT service discovery and encryption…");
+        device.connect().await?;
         log::info!("Services resolved");
 
         let services = device.services().await?;
