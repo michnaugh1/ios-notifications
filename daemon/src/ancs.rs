@@ -21,7 +21,7 @@ use ancs::{
 use anyhow::{bail, Result};
 use bluer::{
     gatt::remote::{Characteristic, CharacteristicWriteRequest},
-    Adapter, Address, DeviceEvent, DeviceProperty, Uuid,
+    Adapter, Address, Uuid,
 };
 use byteorder_pack::UnpackFrom;
 use futures::{pin_mut, StreamExt as _};
@@ -68,32 +68,27 @@ impl AncsProcessor {
         }
         log::info!("Device {} is connected", device_addr);
 
-        // Subscribe to device events BEFORE checking ServicesResolved to avoid
-        // a race where the event fires between our state check and subscription.
-        // BlueZ runs GATT discovery internally on incoming connections — we
-        // just wait for it to finish rather than calling connect() ourselves
-        // (which returns "already in progress" since BlueZ owns the session).
-        let dev_events = device.events().await?;
-        pin_mut!(dev_events);
-
-        if !device.is_services_resolved().await? {
-            log::info!("Waiting for GATT services to resolve…");
-            let deadline =
-                tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-            loop {
-                match tokio::time::timeout_at(deadline, dev_events.next()).await {
-                    Ok(Some(DeviceEvent::PropertyChanged(
-                        DeviceProperty::ServicesResolved(true),
-                    ))) => break,
-                    Ok(Some(e)) => {
-                        log::debug!("device event while waiting: {:?}", e);
-                    }
-                    Ok(None) => bail!("device disconnected while waiting for GATT services"),
-                    Err(_) => bail!("timed out waiting for GATT services to resolve (60s)"),
+        // device.connect() triggers GATT service discovery. iOS simultaneously
+        // establishes BR/EDR (audio, phone) alongside BLE, which BlueZ tracks
+        // as "already in progress". Retry with backoff until both settle.
+        let mut wait_secs = 3u64;
+        loop {
+            match device.connect().await {
+                Ok(()) => {
+                    log::info!("Services resolved");
+                    break;
                 }
+                Err(e) if format!("{e:#}").contains("already in progress") => {
+                    if wait_secs > 30 {
+                        bail!("GATT discovery timed out: device stuck in progress");
+                    }
+                    log::info!("Connect in progress, retrying in {}s…", wait_secs);
+                    tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+                    wait_secs = (wait_secs * 2).min(30);
+                }
+                Err(e) => bail!("GATT discovery failed: {:#}", e),
             }
         }
-        log::info!("Services resolved");
 
         let services = device.services().await?;
         let mut ancs_service = None;
