@@ -1,0 +1,21 @@
+{
+    "KPlugin": {
+        "Authors": [
+            {
+                "Email": "mike@thenorthcoastlegal.com",
+                "Name": "Mike Naughton"
+            }
+        ],
+        "Category": "System Information",
+        "Description": "Connection status for the iOS notifications bridge",
+        "Icon": "phone",
+        "Id": "io.github.michnaugh1.iosnotifications",
+        "License": "MIT",
+        "Name": "iOS Notifications",
+        "Version": "0.1.0",
+        "Website": "https://github.com/michnaugh1/ios-notifications"
+    },
+    "KPackageStructure": "Plasma/Applet",
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-NotificationArea": "true"
+}
