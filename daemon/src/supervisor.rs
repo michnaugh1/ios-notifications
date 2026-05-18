@@ -157,6 +157,251 @@ impl Default for StateMachine {
     }
 }
 
+use std::sync::Arc;
+use std::time::Duration;
+use anyhow::Result;
+use bluer::{Adapter, Address};
+use tokio::sync::{mpsc, RwLock};
+use tokio::time::sleep;
+
+use crate::ancs::AncsProcessor;
+use crate::config::Config;
+use crate::dbus_iface::{IosNotificationsIface, SharedState};
+use crate::filter::Filter;
+
+/// The async driver that owns the state machine and reacts to events.
+pub async fn run_supervisor(
+    config: Config,
+    adapter: Adapter,
+    device_addr: Address,
+    filter: Arc<RwLock<Filter>>,
+    shared: Arc<RwLock<SharedState>>,
+    mut event_rx: mpsc::Receiver<Event>,
+    event_tx: mpsc::Sender<Event>,
+    iface_ref: zbus::object_server::InterfaceRef<IosNotificationsIface>,
+) -> Result<()> {
+    let mut sm = StateMachine::new();
+    let resume_grace = Duration::from_millis(config.supervisor.resume_grace_ms as u64);
+
+    // Kick the machine
+    {
+        let mut s = shared.write().await;
+        s.state = State::Initializing;
+        s.device_address = device_addr.to_string();
+    }
+    sm.handle(Event::Initialized);
+    sync_state(&shared, &sm, &iface_ref, State::Initializing).await;
+
+    // Spawn the logind listener; it forwards PrepareForSleep events.
+    spawn_logind_listener(event_tx.clone());
+
+    loop {
+        let old_state = sm.state();
+
+        match sm.state() {
+            State::Connecting => {
+                // Attempt one connection in a separate task so we can race
+                // against incoming events (Pause, Reconnect, sleep, etc.).
+                let filter_clone = filter.clone();
+                let event_tx_clone = event_tx.clone();
+                let shared_clone = shared.clone();
+                let adapter_clone = adapter.clone();
+                let on_delivered: Box<dyn Fn(String, String) + Send + Sync> = {
+                    let iface_ref = iface_ref.clone();
+                    let shared = shared.clone();
+                    Box::new(move |app_id, title| {
+                        let iface_ref = iface_ref.clone();
+                        let shared = shared.clone();
+                        tokio::spawn(async move {
+                            shared.write().await.notifications_today += 1;
+                            let emitter = iface_ref.signal_emitter();
+                            let _ = IosNotificationsIface::notification_delivered(
+                                emitter, &app_id, &title,
+                            )
+                            .await;
+                        });
+                    })
+                };
+                let on_filtered: Box<dyn Fn(String, String) + Send + Sync> = {
+                    let iface_ref = iface_ref.clone();
+                    Box::new(move |app_id, title| {
+                        let iface_ref = iface_ref.clone();
+                        tokio::spawn(async move {
+                            let emitter = iface_ref.signal_emitter();
+                            let _ = IosNotificationsIface::notification_filtered(
+                                emitter, &app_id, &title,
+                            )
+                            .await;
+                        });
+                    })
+                };
+
+                let attempt = tokio::spawn(async move {
+                    let proc = AncsProcessor::with_callbacks(filter_clone, on_delivered, on_filtered);
+                    let result = proc.main_loop(device_addr, &adapter_clone).await;
+                    let evt = match &result {
+                        Ok(()) => {
+                            // main_loop returns Ok when DeviceRemoved fires
+                            Event::LinkDropped
+                        }
+                        Err(e) => {
+                            let msg = format!("{:#}", e);
+                            shared_clone.write().await.last_error = msg.clone();
+                            if msg.contains("ANCS service not found") {
+                                pop_ancs_missing_notification();
+                                Event::AncsMissing
+                            } else {
+                                Event::ConnectFailed
+                            }
+                        }
+                    };
+                    let _ = event_tx_clone.send(evt).await;
+                });
+
+                // Mark CONNECTED only once main_loop actually subscribes to streams.
+                // For v1 we optimistically transition on attempt start; the
+                // subsequent ConnectFailed will move us back if it fails fast.
+                {
+                    let _ = attempt; // owned by the spawned task
+                }
+                // Tentative success — main_loop blocks while link is alive
+                sm.handle(Event::ConnectSucceeded);
+                sync_state(&shared, &sm, &iface_ref, old_state).await;
+                // Now wait for events
+                if let Some(evt) = event_rx.recv().await {
+                    sm.handle(evt);
+                }
+            }
+
+            State::Backoff => {
+                let secs = sm.backoff_secs();
+                {
+                    let mut s = shared.write().await;
+                    s.next_backoff_secs = secs;
+                }
+                tokio::select! {
+                    _ = sleep(Duration::from_secs(secs as u64)) => {
+                        sm.handle(Event::BackoffElapsed);
+                    }
+                    Some(evt) = event_rx.recv() => {
+                        sm.handle(evt);
+                    }
+                }
+                shared.write().await.next_backoff_secs = 0;
+            }
+
+            State::Error => {
+                tokio::select! {
+                    _ = sleep(Duration::from_secs(30)) => {
+                        sm.handle(Event::ErrorRetry);
+                    }
+                    Some(evt) = event_rx.recv() => {
+                        sm.handle(evt);
+                    }
+                }
+            }
+
+            State::Paused | State::Connected => {
+                // Wait for an external event
+                if let Some(evt) = event_rx.recv().await {
+                    // If this was a wake-from-sleep, observe the grace period.
+                    if matches!(&evt, Event::PrepareForSleep(false)) {
+                        sleep(resume_grace).await;
+                    }
+                    sm.handle(evt);
+                }
+            }
+
+            State::Initializing => {
+                // Should not happen — fall through to Connecting.
+                sm.handle(Event::Initialized);
+            }
+        }
+
+        if sm.state() != old_state {
+            sync_state(&shared, &sm, &iface_ref, old_state).await;
+        }
+    }
+}
+
+async fn sync_state(
+    shared: &Arc<RwLock<SharedState>>,
+    sm: &StateMachine,
+    iface_ref: &zbus::object_server::InterfaceRef<IosNotificationsIface>,
+    old_state: State,
+) {
+    let new_state = sm.state();
+    shared.write().await.state = new_state;
+    let emitter = iface_ref.signal_emitter();
+    // NOTE: signal was renamed connection_state_changed (not state_changed) to avoid
+    // collision with the auto-generated property setter.
+    let _ = IosNotificationsIface::connection_state_changed(
+        emitter,
+        new_state.as_str(),
+        old_state.as_str(),
+    )
+    .await;
+    log::info!(
+        "State: {} -> {}",
+        old_state.as_str(),
+        new_state.as_str()
+    );
+}
+
+fn spawn_logind_listener(event_tx: mpsc::Sender<Event>) {
+    tokio::spawn(async move {
+        let conn = match zbus::Connection::system().await {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("Failed to connect to system bus for logind: {}", e);
+                return;
+            }
+        };
+
+        let proxy = match zbus::Proxy::new(
+            &conn,
+            "org.freedesktop.login1",
+            "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager",
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("Failed to create logind proxy: {}", e);
+                return;
+            }
+        };
+
+        use futures::StreamExt;
+        let mut stream = match proxy.receive_signal("PrepareForSleep").await {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("Failed to subscribe to PrepareForSleep: {}", e);
+                return;
+            }
+        };
+
+        while let Some(msg) = stream.next().await {
+            if let Ok(entering_sleep) = msg.body().deserialize::<bool>() {
+                log::info!("PrepareForSleep({})", entering_sleep);
+                let _ = event_tx.send(Event::PrepareForSleep(entering_sleep)).await;
+            }
+        }
+    });
+}
+
+fn pop_ancs_missing_notification() {
+    let _ = notify_rust::Notification::new()
+        .summary("iOS notifications not shared")
+        .body(
+            "On your iPhone, go to Settings → Bluetooth → tap the (i) next to this computer → enable \"Share System Notifications\".",
+        )
+        .timeout(notify_rust::Timeout::Never)
+        .urgency(notify_rust::Urgency::Critical)
+        .show();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

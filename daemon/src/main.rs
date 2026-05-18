@@ -1,24 +1,27 @@
-use anyhow::Result;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
 use bluer::Address;
 use clap::Parser;
+use tokio::sync::{mpsc, RwLock};
 
-use ios_notificationsd::ancs;
-use ios_notificationsd::config::FilterConfig;
-use ios_notificationsd::filter::Filter;
-use ios_notificationsd::hid_bridge;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+mod ancs;
+mod config;
+mod dbus_iface;
+mod filter;
+mod hid_bridge;
+mod supervisor;
+
+use crate::config::Config;
+use crate::dbus_iface::{IosNotificationsIface, SharedState};
+use crate::filter::Filter;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    #[arg(
-        help = "Public Bluetooth MAC address of the device to connect to (as shown in system or `bluetoothctl`)"
-    )]
-    device_addr: Address,
-
-    #[arg(long, help = "Bluetooth adapter name to use, if not the default one")]
-    adapter: Option<String>,
+    /// Path to config file. Defaults to ~/.config/ios-notifications/config.toml.
+    #[arg(long)]
+    config: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -29,29 +32,89 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let config_path = args.config.unwrap_or_else(Config::default_path);
+
+    let config = match Config::load(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            if !config_path.exists() {
+                eprintln!(
+                    "Config file not found: {}\n\nRun `ios-notifications-pair` first to set up pairing.",
+                    config_path.display()
+                );
+            } else {
+                eprintln!("Config error: {:#}", e);
+            }
+            std::process::exit(1);
+        }
+    };
+
+    log::info!("Loaded config from {}", config_path.display());
+
+    let device_addr: Address = config
+        .device
+        .mac
+        .parse()
+        .with_context(|| format!("invalid MAC address: {}", config.device.mac))?;
+
     let session = bluer::Session::new().await?;
-    let adapter = if let Some(name) = args.adapter {
-        session.adapter(&name)?
-    } else {
-        session.default_adapter().await?
+    let adapter = match config.device.adapter.as_deref() {
+        Some(name) => session.adapter(name)?,
+        None => session.default_adapter().await?,
     };
     adapter.set_powered(true).await?;
     log::info!("Using adapter: {}", adapter.name());
 
-    let (_hid_app, _hid_adv) = match hid_bridge::serve_hid_gatt(&adapter).await {
-        Ok(handles) => handles,
-        Err(e) => {
-            log::warn!("Failed to set up HID GATT service: {:?}", e);
-            return Err(e);
-        }
-    };
-
-    loop {
-        let filter = Arc::new(RwLock::new(Filter::new(FilterConfig::default())));
-        let proc = ancs::AncsProcessor::new(filter);
-        if let Err(e) = proc.main_loop(args.device_addr, &adapter).await {
-            log::error!("Error: {:?}", e);
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    // Verify device is paired; if not, exit with guidance.
+    let device = adapter.device(device_addr).map_err(|e| {
+        anyhow::anyhow!(
+            "Device {} not paired (run ios-notifications-pair): {}",
+            device_addr,
+            e
+        )
+    })?;
+    if !device.is_paired().await.unwrap_or(false) {
+        eprintln!(
+            "Device {} is not paired.\n\nRun `ios-notifications-pair` again.",
+            device_addr
+        );
+        std::process::exit(1);
     }
+
+    // Set up shared state and event channel
+    let shared = Arc::new(RwLock::new(SharedState::new()));
+    let (event_tx, event_rx) = mpsc::channel::<supervisor::Event>(64);
+
+    // Start the D-Bus server
+    let conn = dbus_iface::serve(shared.clone(), event_tx.clone()).await?;
+    let iface_ref = conn
+        .object_server()
+        .interface::<_, IosNotificationsIface>(dbus_iface::OBJECT_PATH)
+        .await?;
+
+    // Filter, hot-reloadable
+    let filter = Arc::new(RwLock::new(Filter::new(config.filter.clone())));
+
+    // HID GATT advertisement (for iOS auto-reconnect).
+    let (_hid_app, _hid_adv) = hid_bridge::serve_hid_gatt(&adapter)
+        .await
+        .map_err(|e| {
+            log::error!("Failed to set up HID GATT service: {:?}", e);
+            e
+        })?;
+
+    // Run supervisor
+    supervisor::run_supervisor(
+        config,
+        adapter,
+        device_addr,
+        filter,
+        shared,
+        event_rx,
+        event_tx,
+        iface_ref,
+    )
+    .await?;
+
+    Ok(())
 }
