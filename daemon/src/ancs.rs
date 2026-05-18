@@ -21,7 +21,7 @@ use ancs::{
 use anyhow::{bail, Result};
 use bluer::{
     gatt::remote::{Characteristic, CharacteristicWriteRequest},
-    Adapter, Address, Uuid,
+    Adapter, Address, DeviceEvent, DeviceProperty, Uuid,
 };
 use byteorder_pack::UnpackFrom;
 use futures::{pin_mut, StreamExt as _};
@@ -67,6 +67,25 @@ impl AncsProcessor {
             return Ok(());
         }
         log::info!("Device {} is connected", device_addr);
+
+        // iOS only exposes ANCS once the BLE connection is encrypted and GATT
+        // discovery is complete. Wait for ServicesResolved before querying —
+        // without this, services() hangs for ~2 minutes then finds nothing.
+        if !device.is_services_resolved().await? {
+            log::info!("Waiting for GATT services to resolve…");
+            let dev_events = device.events().await?;
+            pin_mut!(dev_events);
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                match tokio::time::timeout_at(deadline, dev_events.next()).await {
+                    Ok(Some(DeviceEvent::PropertyChanged(DeviceProperty::ServicesResolved(true)))) => break,
+                    Ok(Some(_)) => continue,
+                    Ok(None) => bail!("device disconnected while waiting for services"),
+                    Err(_) => bail!("timed out waiting for GATT services to resolve"),
+                }
+            }
+        }
+        log::info!("Services resolved");
 
         let services = device.services().await?;
         let mut ancs_service = None;
