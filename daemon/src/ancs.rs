@@ -62,14 +62,27 @@ impl AncsProcessor {
     pub async fn main_loop(mut self, device_addr: Address, adapter: &Adapter) -> Result<()> {
         let device = adapter.device(device_addr)?;
 
+        // Wait for the device to be connected (iOS may not have reconnected yet
+        // after a bluetooth restart). We watch adapter events so we don't spin.
         if !device.is_connected().await? {
-            log::debug!("Device {} is not connected", device_addr);
-            return Ok(());
+            log::info!("Device {} not yet connected, waiting…", device_addr);
+            let events = adapter.events().await?;
+            pin_mut!(events);
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+            loop {
+                match tokio::time::timeout_at(deadline, events.next()).await {
+                    Ok(Some(bluer::AdapterEvent::DeviceAdded(addr))) if addr == device_addr => break,
+                    Ok(Some(_)) => continue,
+                    Ok(None) => bail!("adapter event stream ended"),
+                    Err(_) => bail!("timed out waiting for device to connect (120s)"),
+                }
+            }
         }
         log::info!("Device {} is connected", device_addr);
 
-        // device.connect() triggers GATT service discovery. iOS simultaneously
-        // establishes BR/EDR (audio, phone) alongside BLE, which BlueZ tracks
+        // device.connect() triggers GATT service discovery on the BLE connection.
+        // iOS simultaneously establishes BR/EDR (audio, phone), which BlueZ marks
         // as "already in progress". Retry with backoff until both settle.
         let mut wait_secs = 3u64;
         loop {
