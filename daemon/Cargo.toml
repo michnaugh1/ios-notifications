@@ -23,6 +23,7 @@ log.workspace = true
 notify-rust.workspace = true
 tokio.workspace = true
 # forward-declared for Tasks 4-5 (config/filter) and Task 8 (D-Bus interface):
+dirs.workspace = true
 serde.workspace = true
 toml.workspace = true
 zbus.workspace = true
