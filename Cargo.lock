@@ -823,6 +823,16 @@ dependencies = [
 [[package]]
 name = "ios-notifications-pair"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bluer",
+ "clap",
+ "dirs",
+ "env_logger",
+ "futures",
+ "log",
+ "tokio",
+]
 
 [[package]]
 name = "ios-notificationsd"

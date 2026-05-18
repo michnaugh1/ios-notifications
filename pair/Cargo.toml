@@ -1,6 +1,6 @@
 [package]
 name = "ios-notifications-pair"
-description = "iOS pairing helper"
+description = "Interactive pairing helper for ios-notifications"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,3 +10,13 @@ repository.workspace = true
 [[bin]]
 name = "ios-notifications-pair"
 path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+bluer.workspace = true
+clap.workspace = true
+env_logger.workspace = true
+futures.workspace = true
+log.workspace = true
+tokio.workspace = true
+dirs.workspace = true
