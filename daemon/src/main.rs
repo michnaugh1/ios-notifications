@@ -2,8 +2,8 @@ use anyhow::Result;
 use bluer::Address;
 use clap::Parser;
 
-mod ancs;
-mod hid_bridge;
+use ios_notificationsd::ancs;
+use ios_notificationsd::hid_bridge;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]

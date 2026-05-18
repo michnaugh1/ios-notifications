@@ -54,6 +54,7 @@ pub async fn serve_hid_gatt(
             uuid: Uuid::from_u16(0x1812),
             primary: true,
             characteristics: vec![
+                // HID Information: version 1.11, not localized, NormallyConnectable
                 Characteristic {
                     uuid: Uuid::from_u16(0x2A4A),
                     read: Some(CharacteristicRead {
@@ -68,6 +69,7 @@ pub async fn serve_hid_gatt(
                     }),
                     ..Default::default()
                 },
+                // Report Map
                 Characteristic {
                     uuid: Uuid::from_u16(0x2A4B),
                     read: Some(CharacteristicRead {
@@ -82,6 +84,7 @@ pub async fn serve_hid_gatt(
                     }),
                     ..Default::default()
                 },
+                // HID Control Point — accept Suspend/Exit Suspend, no-op
                 Characteristic {
                     uuid: Uuid::from_u16(0x2A4C),
                     write: Some(CharacteristicWrite {
@@ -100,6 +103,7 @@ pub async fn serve_hid_gatt(
                     }),
                     ..Default::default()
                 },
+                // Protocol Mode — report protocol, accept writes
                 Characteristic {
                     uuid: Uuid::from_u16(0x2A4E),
                     read: Some(CharacteristicRead {
@@ -128,6 +132,7 @@ pub async fn serve_hid_gatt(
                     }),
                     ..Default::default()
                 },
+                // Report (input) with Report Reference descriptor
                 Characteristic {
                     uuid: Uuid::from_u16(0x2A4D),
                     read: Some(CharacteristicRead {
