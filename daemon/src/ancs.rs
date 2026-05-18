@@ -21,7 +21,7 @@ use ancs::{
 use anyhow::{bail, Result};
 use bluer::{
     gatt::remote::{Characteristic, CharacteristicWriteRequest},
-    Adapter, Address, Uuid,
+    Adapter, Address, DeviceEvent, DeviceProperty, Uuid,
 };
 use byteorder_pack::UnpackFrom;
 use futures::{pin_mut, StreamExt as _};
@@ -68,12 +68,31 @@ impl AncsProcessor {
         }
         log::info!("Device {} is connected", device_addr);
 
-        // When iOS connects to us (HID peripheral role), BlueZ has an HCI
-        // connection but hasn't run GATT service discovery or requested
-        // encryption. device.connect() does both — it blocks until GATT
-        // discovery completes and ServicesResolved becomes true.
-        log::info!("Triggering GATT service discovery and encryption…");
-        device.connect().await?;
+        // Subscribe to device events BEFORE checking ServicesResolved to avoid
+        // a race where the event fires between our state check and subscription.
+        // BlueZ runs GATT discovery internally on incoming connections — we
+        // just wait for it to finish rather than calling connect() ourselves
+        // (which returns "already in progress" since BlueZ owns the session).
+        let dev_events = device.events().await?;
+        pin_mut!(dev_events);
+
+        if !device.is_services_resolved().await? {
+            log::info!("Waiting for GATT services to resolve…");
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                match tokio::time::timeout_at(deadline, dev_events.next()).await {
+                    Ok(Some(DeviceEvent::PropertyChanged(
+                        DeviceProperty::ServicesResolved(true),
+                    ))) => break,
+                    Ok(Some(e)) => {
+                        log::debug!("device event while waiting: {:?}", e);
+                    }
+                    Ok(None) => bail!("device disconnected while waiting for GATT services"),
+                    Err(_) => bail!("timed out waiting for GATT services to resolve (60s)"),
+                }
+            }
+        }
         log::info!("Services resolved");
 
         let services = device.services().await?;
