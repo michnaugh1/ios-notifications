@@ -1,0 +1,20 @@
+[Unit]
+Description=iOS notifications bridge (ANCS over Bluetooth LE)
+After=bluetooth.target dbus.socket
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/ios-notificationsd
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+
+# Modest hardening (per-user service, so blast radius is small)
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config/ios-notifications
+
+[Install]
+WantedBy=default.target
