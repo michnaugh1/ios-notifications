@@ -61,15 +61,15 @@ PlasmoidItem {
             const stdout = (data["stdout"] || "").trim();
             disconnectSource(sourceName);
             // Route by source name prefix
-            if (sourceName.startsWith("get:State|")) {
+            if (sourceName.includes("get:State|")) {
                 if (stdout) daemonState = stdout;
-            } else if (sourceName.startsWith("get:DeviceAddress|")) {
+            } else if (sourceName.includes("get:DeviceAddress|")) {
                 deviceAddress = stdout;
-            } else if (sourceName.startsWith("get:LastError|")) {
+            } else if (sourceName.includes("get:LastError|")) {
                 lastError = stdout;
-            } else if (sourceName.startsWith("get:NotificationsToday|")) {
+            } else if (sourceName.includes("get:NotificationsToday|")) {
                 notificationsToday = parseInt(stdout) || 0;
-            } else if (sourceName.startsWith("get:NextBackoffSecs|")) {
+            } else if (sourceName.includes("get:NextBackoffSecs|")) {
                 nextBackoffSecs = parseInt(stdout) || 0;
             }
         }
