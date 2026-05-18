@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use bluer::{Adapter, Address, AdapterEvent, Device, Uuid};
+use bluer::{Adapter, Address, AdapterEvent, Device, Uuid, UuidExt};
 use bluer::adv::{Advertisement, Type as AdvType};
 use clap::Parser;
 use futures::{pin_mut, StreamExt};
@@ -64,9 +64,13 @@ async fn run(args: &Args, config_path: &Path) -> Result<()> {
     adapter.set_discoverable(true).await?;
     adapter.set_discoverable_timeout(args.timeout).await?;
     // set_discoverable only covers BR/EDR inquiry; BLE requires an active
-    // advertisement so iOS can find the adapter during scanning.
+    // advertisement. Advertise as a HID keyboard (UUID 0x1812, appearance
+    // 0x03C1) so iOS shows this device in Bluetooth Settings → Other Devices.
+    // Generic advertisements (local name only) are invisible to iOS pairing UI.
     let adv = Advertisement {
         advertisement_type: AdvType::Peripheral,
+        service_uuids: [Uuid::from_u16(0x1812)].into(),
+        appearance: Some(0x03C1),
         local_name: Some(adapter.name().to_string()),
         discoverable: Some(true),
         ..Default::default()
