@@ -16,7 +16,7 @@ Early development. See [docs/superpowers/specs/2026-05-18-ios-notifications-desi
 
 ## Requirements
 
-- Ubuntu 26.04 LTS or another modern systemd-based Linux distro
+- Kubuntu 26.04 LTS or another modern systemd-based Linux distro
 - BlueZ 5.66 or newer (`bluetoothctl --version`)
 - KDE Plasma 6.0 or newer
 - Bluetooth 4.0+ adapter
