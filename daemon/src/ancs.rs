@@ -62,53 +62,54 @@ impl AncsProcessor {
     pub async fn main_loop(mut self, device_addr: Address, adapter: &Adapter) -> Result<()> {
         let device = adapter.device(device_addr)?;
 
-        // Wait for the device to be connected (iOS may not have reconnected yet
-        // after a bluetooth restart). We watch adapter events so we don't spin.
+        // Actively connect to the device. BlueZ's Connect() drives the BLE
+        // handshake from our side; passively waiting for iOS to reconnect on
+        // its own is unreliable — iOS only auto-initiates for profiles it owns.
+        // If already connected this is a fast no-op; if the BR/EDR link is up
+        // but not LE, this triggers the LE pairing/service-discovery sequence.
         if !device.is_connected().await? {
-            log::info!("Device {} not yet connected, waiting…", device_addr);
-            let events = adapter.events().await?;
-            pin_mut!(events);
-            let deadline =
-                tokio::time::Instant::now() + std::time::Duration::from_secs(120);
-            loop {
-                match tokio::time::timeout_at(deadline, events.next()).await {
-                    Ok(Some(bluer::AdapterEvent::DeviceAdded(addr))) if addr == device_addr => break,
-                    Ok(Some(_)) => continue,
-                    Ok(None) => bail!("adapter event stream ended"),
-                    Err(_) => bail!("timed out waiting for device to connect (120s)"),
-                }
-            }
+            log::info!("Device {} not connected, calling connect()…", device_addr);
         }
-        log::info!("Device {} is connected", device_addr);
-
-        // device.connect() triggers GATT service discovery on the BLE connection.
-        // iOS simultaneously establishes BR/EDR (audio, phone), which BlueZ marks
-        // as "already in progress". Retry with backoff until both settle.
-        let mut wait_secs = 3u64;
-        loop {
-            match device.connect().await {
-                Ok(()) => {
-                    log::info!("Services resolved");
-                    break;
-                }
-                Err(e) if format!("{e:#}").contains("already in progress") => {
-                    if wait_secs > 30 {
-                        bail!("GATT discovery timed out: device stuck in progress");
-                    }
-                    log::info!("Connect in progress, retrying in {}s…", wait_secs);
-                    tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
-                    wait_secs = (wait_secs * 2).min(30);
-                }
-                Err(e) => bail!("GATT discovery failed: {:#}", e),
+        match device.connect().await {
+            Ok(()) => log::info!("Device {} connected", device_addr),
+            // BlueZ returns "Already Exists" when the link is already up — fine.
+            Err(e) if format!("{e:#}").to_lowercase().contains("already") => {
+                log::info!("Device {} already connected", device_addr);
             }
+            Err(e) => bail!("connect() failed: {:#}", e),
         }
 
-        let services = device.services().await?;
+        // Try the standard path first (ServicesResolved fires quickly on fresh connections).
+        // If it takes more than 8s it means BlueZ isn't doing auto-discovery for this
+        // connection (common when iOS also has a BR/EDR link in progress). In that case
+        // fall back to scanning D-Bus objects directly — bluer caches discovered services
+        // as D-Bus objects, so they're already there even when ServicesResolved = false.
+        log::info!("Waiting for GATT services to resolve…");
+        let services = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            device.services(),
+        ).await {
+            Ok(Ok(svcs)) if !svcs.is_empty() => {
+                log::info!("Services resolved via standard path ({} found)", svcs.len());
+                svcs
+            }
+            Ok(Ok(_)) => {
+                // ServicesResolved fired before GATT objects were populated (timing race).
+                log::warn!("ServicesResolved returned 0 services; falling back to D-Bus scan…");
+                scan_services_from_dbus(&device).await?
+            }
+            Ok(Err(e)) => bail!("GATT service resolution failed: {}", e),
+            Err(_) => {
+                log::warn!("ServicesResolved not firing; scanning cached D-Bus objects…");
+                scan_services_from_dbus(&device).await?
+            }
+        };
         let mut ancs_service = None;
         for s in services {
-            if s.uuid().await? == ANCS_SERVICE_UUID {
+            let uuid = s.uuid().await?;
+            log::debug!("GATT service: {}", uuid);
+            if uuid == ANCS_SERVICE_UUID {
                 ancs_service = Some(s);
-                break;
             }
         }
         let ancs_service = match ancs_service {
@@ -124,6 +125,7 @@ impl AncsProcessor {
         let control_point_uuid: Uuid = "69D1D8F3-45E1-49A8-9821-9BBDFDAAD9D9".parse()?;
         for c in ancs_service.characteristics().await? {
             let uuid = c.uuid().await?;
+            log::debug!("  ANCS characteristic: {}", uuid);
             if uuid == noti_source_uuid {
                 notification_source = Some(c);
             } else if uuid == data_source_uuid {
@@ -138,6 +140,23 @@ impl AncsProcessor {
 
         self.control_point = Some(control_point);
 
+        // iOS persists CCCD state for bonded devices. If CCCD was already 0x0001
+        // from a previous session, iOS sees our subscribe as a no-op and won't
+        // reinitialize the ANCS session or send new events. Force a 0→1 transition
+        // by writing 0x0000 first, then subscribing normally via notify().
+        let cccd_uuid: Uuid = "00002902-0000-1000-8000-00805f9b34fb".parse()?;
+        for char_ref in [&data_source, &notification_source] {
+            for desc in char_ref.descriptors().await.unwrap_or_default() {
+                if desc.uuid().await.unwrap_or_default() == cccd_uuid {
+                    match desc.write(&[0x00, 0x00]).await {
+                        Ok(()) => log::info!("CCCD reset to 0x0000 ok"),
+                        Err(e) => log::warn!("CCCD reset failed (BlueZ may suppress it): {}", e),
+                    }
+                    break;
+                }
+            }
+        }
+
         let data_source_stream = data_source.notify().await?;
         pin_mut!(data_source_stream);
         let notification_stream = notification_source.notify().await?;
@@ -147,13 +166,29 @@ impl AncsProcessor {
 
         log::info!("Starting to listen for notifications");
 
+        // Detect iOS-initiated disconnects even when streams don't close cleanly.
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
+        heartbeat.tick().await; // skip the immediate first tick
+
         loop {
             tokio::select! {
-                Some(noti) = notification_stream.next() => {
-                    self.process_notification(noti).await?;
+                maybe_noti = notification_stream.next() => {
+                    match maybe_noti {
+                        Some(noti) => {
+                            log::debug!("Raw notification source bytes: {:02x?}", noti);
+                            self.process_notification(noti).await?;
+                        }
+                        None => bail!("ANCS notification stream closed; will reconnect"),
+                    }
                 }
-                Some(data) = data_source_stream.next() => {
-                    self.process_data(data).await?;
+                maybe_data = data_source_stream.next() => {
+                    match maybe_data {
+                        Some(data) => {
+                            log::debug!("Raw data source bytes: {:02x?}", data);
+                            self.process_data(data).await?;
+                        }
+                        None => bail!("ANCS data source stream closed; will reconnect"),
+                    }
                 }
                 Some(event) = events_stream.next() => {
                     if let bluer::AdapterEvent::DeviceRemoved(addr) = event {
@@ -161,6 +196,11 @@ impl AncsProcessor {
                             log::info!("Device removed, stopping");
                             break;
                         }
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    if !device.is_connected().await.unwrap_or(true) {
+                        bail!("device disconnected (heartbeat); will reconnect");
                     }
                 }
                 else => break,
@@ -173,10 +213,16 @@ impl AncsProcessor {
         let (event_id, event_flags, _category_id, _category_count, notification_uid) =
             <(u8, u8, u8, u8, u32)>::unpack_from_le(&mut Cursor::new(&noti))?;
 
+        log::info!(
+            "ANCS event: id={} flags={:#04x} uid={}",
+            event_id, event_flags, notification_uid
+        );
+
         if event_id == EventID::NotificationRemoved as u8 {
             return Ok(());
         }
         if event_flags & EventFlag::PreExisting as u8 != 0 {
+            log::info!("Skipping pre-existing notification {}", notification_uid);
             return Ok(());
         }
 
@@ -318,4 +364,27 @@ impl AncsProcessor {
         }
         Ok(())
     }
+}
+
+/// Enumerate GATT services from cached D-Bus objects without waiting for
+/// ServicesResolved. BlueZ persists discovered service objects across connections,
+/// so they're available even when the ServicesResolved flag is false (which
+/// happens when a BR/EDR connection is in progress on the same dual-mode device).
+async fn scan_services_from_dbus(device: &bluer::Device) -> Result<Vec<bluer::gatt::remote::Service>> {
+    let mut services = Vec::new();
+    // GATT handle IDs are small; iPhones have < 60 services in practice.
+    // Trying 1..=0x100 covers all realistic cases with minimal overhead.
+    for id in 1u16..=0x100 {
+        if let Ok(svc) = device.service(id).await {
+            // uuid() is a D-Bus property read; fails for non-existent IDs.
+            if svc.uuid().await.is_ok() {
+                services.push(svc);
+            }
+        }
+    }
+    log::info!("D-Bus scan found {} cached GATT services", services.len());
+    if services.is_empty() {
+        bail!("no cached GATT services found; device may need a fresh BLE connection");
+    }
+    Ok(services)
 }

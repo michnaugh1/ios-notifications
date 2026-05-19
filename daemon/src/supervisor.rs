@@ -195,6 +195,11 @@ pub async fn run_supervisor(
     // Spawn the logind listener; it forwards PrepareForSleep events.
     spawn_logind_listener(event_tx.clone());
 
+    // Spawn a watcher that sends Reconnect the moment iOS reconnects over BLE.
+    // This lets the supervisor skip the remaining backoff sleep instead of
+    // waiting up to 60 s for the next scheduled retry.
+    spawn_device_reconnect_watcher(event_tx.clone(), adapter.clone(), device_addr, shared.clone());
+
     loop {
         let old_state = sm.state();
 
@@ -246,6 +251,7 @@ pub async fn run_supervisor(
                         }
                         Err(e) => {
                             let msg = format!("{:#}", e);
+                            log::warn!("ANCS connection failed: {}", msg);
                             shared_clone.write().await.last_error = msg.clone();
                             if msg.contains("ANCS service not found") {
                                 pop_ancs_missing_notification();
@@ -386,6 +392,44 @@ fn spawn_logind_listener(event_tx: mpsc::Sender<Event>) {
             if let Ok(entering_sleep) = msg.body().deserialize::<bool>() {
                 log::info!("PrepareForSleep({})", entering_sleep);
                 let _ = event_tx.send(Event::PrepareForSleep(entering_sleep)).await;
+            }
+        }
+    });
+}
+
+fn spawn_device_reconnect_watcher(
+    event_tx: mpsc::Sender<Event>,
+    adapter: bluer::Adapter,
+    device_addr: bluer::Address,
+    shared: Arc<RwLock<crate::dbus_iface::SharedState>>,
+) {
+    tokio::spawn(async move {
+        let device = match adapter.device(device_addr) {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("reconnect watcher: cannot get device: {}", e);
+                return;
+            }
+        };
+        let events = match device.events().await {
+            Ok(e) => e,
+            Err(e) => {
+                log::warn!("reconnect watcher: cannot subscribe to device events: {}", e);
+                return;
+            }
+        };
+        use futures::StreamExt;
+        let mut events = Box::pin(events);
+        while let Some(evt) = events.next().await {
+            if let bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::Connected(true)) = evt {
+                let state = shared.read().await.state;
+                match state {
+                    State::Backoff | State::Error | State::Connecting => {
+                        log::info!("device reconnected (BLE event); skipping backoff");
+                        let _ = event_tx.send(Event::Reconnect).await;
+                    }
+                    _ => {}
+                }
             }
         }
     });
