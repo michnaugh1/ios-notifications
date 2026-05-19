@@ -2,8 +2,10 @@
 //!
 //! Inherited from kmod-midori/ancs-linux @ 6883f2b with minor adaptations
 //! (will be extended for filtering in Task 6).
+ 
+use roxmltree;
 
-use std::{collections::HashMap, io::Cursor, sync::Arc};
+use std::{io::Cursor, sync::Arc};
 
 use ancs::{
     attributes::{
@@ -33,27 +35,40 @@ pub const ANCS_SERVICE_UUID: Uuid = Uuid::from_u128(0x7905F431B5CE4E99A40F4B1E12
 
 pub struct AncsProcessor {
     control_point: Option<Characteristic>,
-    app_names: HashMap<String, String>,
+    shared: Arc<RwLock<crate::dbus_iface::SharedState>>,
     filter: Arc<RwLock<Filter>>,
+    on_connected: Box<dyn Fn() + Send + Sync>,
     on_delivered: Box<dyn Fn(String, String) + Send + Sync>,
     on_filtered: Box<dyn Fn(String, String) + Send + Sync>,
 }
 
 impl AncsProcessor {
     #[allow(dead_code)]
-    pub fn new(filter: Arc<RwLock<Filter>>) -> Self {
-        Self::with_callbacks(filter, Box::new(|_, _| {}), Box::new(|_, _| {}))
+    pub fn new(
+        shared: Arc<RwLock<crate::dbus_iface::SharedState>>,
+        filter: Arc<RwLock<Filter>>,
+    ) -> Self {
+        Self::with_callbacks(
+            shared,
+            filter,
+            Box::new(|| {}),
+            Box::new(|_, _| {}),
+            Box::new(|_, _| {}),
+        )
     }
 
     pub fn with_callbacks(
+        shared: Arc<RwLock<crate::dbus_iface::SharedState>>,
         filter: Arc<RwLock<Filter>>,
+        on_connected: Box<dyn Fn() + Send + Sync>,
         on_delivered: Box<dyn Fn(String, String) + Send + Sync>,
         on_filtered: Box<dyn Fn(String, String) + Send + Sync>,
     ) -> Self {
         Self {
             control_point: None,
-            app_names: HashMap::new(),
+            shared,
             filter,
+            on_connected,
             on_delivered,
             on_filtered,
         }
@@ -165,6 +180,7 @@ impl AncsProcessor {
         pin_mut!(events_stream);
 
         log::info!("Starting to listen for notifications");
+        (self.on_connected)();
 
         // Detect iOS-initiated disconnects even when streams don't close cleanly.
         let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
@@ -259,11 +275,14 @@ impl AncsProcessor {
                     match attr.id {
                         NotificationAttributeID::AppIdentifier => {
                             if let Some(id) = attr.value {
-                                if let Some(name) = self.app_names.get(&id) {
-                                    current_app_name_display = Some(name.clone());
-                                } else {
-                                    current_app_name_display = Some(id.clone());
-                                    app_id_to_query = Some(id.clone());
+                                {
+                                    let s = self.shared.read().await;
+                                    if let Some(name) = s.app_names.get(&id) {
+                                        current_app_name_display = Some(name.clone());
+                                    } else {
+                                        current_app_name_display = Some(id.clone());
+                                        app_id_to_query = Some(id.clone());
+                                    }
                                 }
                                 current_app_id = Some(id);
                             }
@@ -339,7 +358,7 @@ impl AncsProcessor {
                 if attribute.id == AppAttributeID::DisplayName {
                     if let Some(name) = attribute.value {
                         log::info!("{} => {}", app_id, name);
-                        self.app_names.insert(app_id.to_string(), name);
+                        self.shared.write().await.app_names.insert(app_id.to_string(), name);
                     }
                 } else {
                     log::info!("Unknown app attribute: {:?}", attribute);
@@ -368,20 +387,45 @@ impl AncsProcessor {
 
 /// Enumerate GATT services from cached D-Bus objects without waiting for
 /// ServicesResolved. BlueZ persists discovered service objects across connections,
-/// so they're available even when the ServicesResolved flag is false (which
-/// happens when a BR/EDR connection is in progress on the same dual-mode device).
+/// so they're available even when the ServicesResolved flag is false.
 async fn scan_services_from_dbus(device: &bluer::Device) -> Result<Vec<bluer::gatt::remote::Service>> {
     let mut services = Vec::new();
-    // GATT handle IDs are small; iPhones have < 60 services in practice.
-    // Trying 1..=0x100 covers all realistic cases with minimal overhead.
-    for id in 1u16..=0x100 {
-        if let Ok(svc) = device.service(id).await {
-            // uuid() is a D-Bus property read; fails for non-existent IDs.
-            if svc.uuid().await.is_ok() {
-                services.push(svc);
+    let adapter_name = device.adapter_name();
+    let addr = device.address();
+    let device_path = format!(
+        "/org/bluez/{}/dev_{}",
+        adapter_name,
+        addr.to_string().replace(':', "_")
+    );
+
+    log::debug!("Introspecting device path: {}", device_path);
+
+    let conn = zbus::Connection::system().await?;
+    let proxy = zbus::fdo::IntrospectableProxy::builder(&conn)
+        .destination("org.bluez")?
+        .path(device_path)?
+        .build()
+        .await?;
+
+    let xml = proxy.introspect().await?;
+    let node = roxmltree::Document::parse(&xml)?;
+
+    for child in node.root_element().children() {
+        if child.has_tag_name("node") {
+            if let Some(name) = child.attribute("name") {
+                if name.starts_with("service") {
+                    if let Ok(id) = u16::from_str_radix(&name[7..], 16) {
+                        if let Ok(svc) = device.service(id).await {
+                            if svc.uuid().await.is_ok() {
+                                services.push(svc);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
+
     log::info!("D-Bus scan found {} cached GATT services", services.len());
     if services.is_empty() {
         bail!("no cached GATT services found; device may need a fresh BLE connection");

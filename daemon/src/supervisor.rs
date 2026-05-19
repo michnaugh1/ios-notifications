@@ -240,9 +240,24 @@ pub async fn run_supervisor(
                         });
                     })
                 };
+                let on_connected: Box<dyn Fn() + Send + Sync> = {
+                    let event_tx = event_tx.clone();
+                    Box::new(move || {
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            let _ = event_tx.send(Event::ConnectSucceeded).await;
+                        });
+                    })
+                };
 
-                let attempt = tokio::spawn(async move {
-                    let proc = AncsProcessor::with_callbacks(filter_clone, on_delivered, on_filtered);
+                let _attempt = tokio::spawn(async move {
+                    let proc = AncsProcessor::with_callbacks(
+                        shared_clone.clone(),
+                        filter_clone,
+                        on_connected,
+                        on_delivered,
+                        on_filtered,
+                    );
                     let result = proc.main_loop(device_addr, &adapter_clone).await;
                     let evt = match &result {
                         Ok(()) => {
@@ -264,16 +279,7 @@ pub async fn run_supervisor(
                     let _ = event_tx_clone.send(evt).await;
                 });
 
-                // Mark CONNECTED only once main_loop actually subscribes to streams.
-                // For v1 we optimistically transition on attempt start; the
-                // subsequent ConnectFailed will move us back if it fails fast.
-                {
-                    let _ = attempt; // owned by the spawned task
-                }
-                // Tentative success — main_loop blocks while link is alive
-                sm.handle(Event::ConnectSucceeded);
-                sync_state(&shared, &sm, &iface_ref, old_state).await;
-                // Now wait for events
+                // Wait for events
                 if let Some(evt) = event_rx.recv().await {
                     sm.handle(evt);
                 }

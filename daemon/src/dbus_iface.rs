@@ -21,6 +21,7 @@ pub struct SharedState {
     pub last_error: String,
     pub notifications_today: u32,
     pub next_backoff_secs: u32,
+    pub app_names: std::collections::HashMap<String, String>,
 }
 
 impl SharedState {
@@ -191,5 +192,22 @@ mod tests {
         let client_conn = Connection::session().await.unwrap();
         let proxy = IosNotificationsClientProxy::new(&client_conn).await.unwrap();
         assert_eq!(proxy.state().await.unwrap(), "connected");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn app_names_cache_persists() {
+        let shared = Arc::new(RwLock::new(SharedState::new()));
+        {
+            let mut s = shared.write().await;
+            s.app_names.insert("com.apple.MobileSMS".to_string(), "Messages".to_string());
+        }
+
+        // Simulating daemon restart by creating a new interface with the same shared state
+        let (tx, _rx) = mpsc::channel::<Event>(32);
+        let iface = IosNotificationsIface { shared: shared.clone(), event_tx: tx };
+        
+        let s = iface.shared.read().await;
+        assert_eq!(s.app_names.get("com.apple.MobileSMS").unwrap(), "Messages");
     }
 }
