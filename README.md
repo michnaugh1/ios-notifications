@@ -6,11 +6,22 @@ Forward iPhone notifications to your Linux desktop over Bluetooth — no iPhone 
 
 iMessages, calendar alerts, and app notifications appear natively in your desktop notification center. Works with KDE Plasma, GNOME, and any other desktop that supports the standard `org.freedesktop.Notifications` D-Bus interface.
 
-## How it works
-
 Your iPhone continuously broadcasts its notifications to trusted Bluetooth devices using Apple's [Notification Center Service (ANCS)](https://developer.apple.com/library/archive/documentation/CoreBluetooth/Reference/AppleNotificationCenterServiceSpecification/Specification/Specification.html) protocol. This daemon subscribes to that stream and converts each notification into a standard Linux desktop notification.
 
+To ensure high reliability, the daemon uses several advanced techniques:
+- **HID Keyboard Emulation**: It advertises itself as a Bluetooth HID Keyboard. iOS is much more likely to automatically reconnect to a "keyboard" than a generic data device.
+- **Smart App Caching**: App names (like "Messages" or "WhatsApp") are cached in memory so that notifications are shown instantly upon reconnection without waiting for a fresh database query.
+- **GATT-Aware Heartbeat**: The daemon monitors the health of the notification "pipes" themselves, not just the Bluetooth link, ensuring it can recover if the stream hangs.
+
 Everything runs locally over Bluetooth LE — nothing leaves your home network.
+
+## Features
+
+- **Native Notifications**: Fully integrated with KDE Plasma, GNOME, and standard D-Bus notification servers.
+- **Automatic Reconnect**: Seamlessly picks up notifications when you return to your computer.
+- **App Filtering**: Blacklist or whitelist specific apps via a simple TOML config.
+- **Privacy First**: No cloud, no internet access required, and no third-party iOS app to install.
+- **D-Bus Interface**: Real-time state and notification counters accessible via `busctl`.
 
 ## Requirements
 
@@ -109,6 +120,7 @@ busctl --user call io.github.michnaugh1.IosNotifications \
 **Connection keeps dropping**
 - Make sure your Bluetooth adapter supports BLE: `btmgmt info | grep le`
 - Try toggling Bluetooth off and on on both devices
+- If discovery is slow, the daemon now uses an optimized D-Bus introspection method to find services faster.
 
 ## Building from source
 
