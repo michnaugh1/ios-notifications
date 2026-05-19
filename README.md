@@ -2,120 +2,142 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A Linux daemon and Plasma 6 plasmoid that bridge iOS notifications to
-KDE Plasma via Bluetooth LE using the Apple Notification Center Service
-(ANCS) protocol.
+Forward iPhone notifications to your Linux desktop over Bluetooth — no iPhone app, no cloud, no Mac required.
 
-iMessages, calendar alerts, app pings, and other iOS notifications appear
-directly in the Plasma notification center — no iPhone app required, no
-Mac in the loop.
+iMessages, calendar alerts, and app notifications appear natively in your desktop notification center. Works with KDE Plasma, GNOME, and any other desktop that supports the standard `org.freedesktop.Notifications` D-Bus interface.
 
-## Status
+## How it works
 
-Early development. See [docs/superpowers/specs/2026-05-18-ios-notifications-design.md](docs/superpowers/specs/2026-05-18-ios-notifications-design.md).
+Your iPhone continuously broadcasts its notifications to trusted Bluetooth devices using Apple's [Notification Center Service (ANCS)](https://developer.apple.com/library/archive/documentation/CoreBluetooth/Reference/AppleNotificationCenterServiceSpecification/Specification/Specification.html) protocol. This daemon subscribes to that stream and converts each notification into a standard Linux desktop notification.
+
+Everything runs locally over Bluetooth LE — nothing leaves your home network.
 
 ## Requirements
 
-- Kubuntu 26.04 LTS or another modern systemd-based Linux distro
-- BlueZ 5.66 or newer (`bluetoothctl --version`)
-- KDE Plasma 6.0 or newer
-- Bluetooth 4.0+ adapter
-- iPhone with iOS 14 or newer (tested on iOS 26)
-- Rust toolchain to build (Rust 1.78+; install via `rustup`)
+- **Linux** with systemd (Ubuntu 22.04+, Fedora 36+, Arch, or similar)
+- **BlueZ 5.x** (`bluetoothctl --version` to check)
+- **Bluetooth 4.0+ adapter** (most laptops and USB adapters from 2012 onward)
+- **iPhone** running iOS 7 or later
+- **x86_64** CPU (ARM builds coming later)
 
 ## Install
 
 ```bash
-git clone https://github.com/michnaugh1/ios-notifications.git
-cd ios-notifications
-./scripts/install-daemon.sh
-./scripts/install-tray.sh
-ios-notifications-pair                 # one-shot interactive pairing
+curl -fsSL https://raw.githubusercontent.com/michnaugh1/ios-notifications/main/install.sh | bash
+```
+
+The script checks prerequisites, downloads the latest release binary, installs it to `~/.local/bin`, and sets up the systemd service.
+
+### Pair your iPhone (once)
+
+Run the pairing wizard and follow the on-screen instructions:
+
+```bash
+ios-notifications-pair
+```
+
+The wizard will make your computer discoverable, wait for you to tap it in iPhone Settings → Bluetooth, and guide you through granting notification access on the iPhone side.
+
+> **Important:** If you have a Pebble, Fitbit, or other smartwatch connected to your iPhone via Bluetooth, disconnect it before pairing and before using this tool. Apple only allows one Bluetooth device to receive notifications at a time — the watch will silently consume them all.
+
+### Start the service
+
+```bash
 systemctl --user enable --now ios-notifications.service
 ```
 
-Add the "iOS Notifications" widget to a Plasma panel via right-click →
-Add Widgets.
+To watch the live logs:
+
+```bash
+journalctl --user -u ios-notifications -f
+```
+
+### KDE Plasma tray widget (optional)
+
+Clone the repo and install the plasmoid:
+
+```bash
+git clone https://github.com/michnaugh1/ios-notifications.git
+cd ios-notifications
+./scripts/install-tray.sh
+```
+
+Then right-click a Plasma panel → Add Widgets → search for "iOS Notifications".
 
 ## Configuration
 
-`~/.config/ios-notifications/config.toml`:
+The config file lives at `~/.config/ios-notifications/config.toml` and is created automatically by the pair wizard. Edit it to filter which apps can send notifications:
 
 ```toml
 [device]
-mac = "AA:BB:CC:DD:EE:FF"  # written by pair helper
+mac = "AA:BB:CC:DD:EE:FF"   # written by the pair wizard — do not change
 
 [filter]
-mode = "blacklist"          # "blacklist", "whitelist", or "off"
+mode = "blacklist"           # "blacklist" = block listed apps (default)
+                             # "whitelist" = only allow listed apps
+                             # "off"       = show everything
 apps = [
-  # "com.apple.Stocks",
-  # "com.apple.news",
+  "com.apple.Stocks",
+  "com.apple.news",
 ]
 ```
 
-Reload without restart:
+Reload the config without restarting the service:
+
 ```bash
 busctl --user call io.github.michnaugh1.IosNotifications \
-  /IosNotifications \
-  io.github.michnaugh1.IosNotifications1 ReloadConfig
+  /IosNotifications io.github.michnaugh1.IosNotifications1 ReloadConfig
 ```
 
-## Architecture
+## Troubleshooting
 
-Three components:
+**No notifications appearing at all**
+- Check the logs: `journalctl --user -u ios-notifications -f`
+- On your iPhone, go to Settings → Bluetooth → tap the **(i)** next to your computer → make sure **Share System Notifications** is on
+- Disconnect any smartwatches from your iPhone — they silently steal the notification stream
 
-- **`ios-notificationsd`** — Rust daemon. Speaks ANCS, applies filter rules,
-  forwards to `org.freedesktop.Notifications` (which Plasma renders natively).
-- **`ios-notifications-pair`** — One-shot CLI. Walks you through pairing.
-- **iOS Notifications plasmoid** — Plasma 6 widget. Shows connection
-  state and exposes Reconnect / Pause / Resume actions.
+**Notifications stop after iPhone screen turns off**
+- This is normal: iOS drops the Bluetooth connection when the screen turns off. The daemon detects this within ~15 seconds and reconnects automatically when the screen comes back on
+- If it doesn't reconnect, restart the service: `systemctl --user restart ios-notifications.service`
 
-See the [design spec](docs/superpowers/specs/2026-05-18-ios-notifications-design.md)
-for protocol details, state machine, and D-Bus interface.
+**"Device not paired" error at startup**
+- iOS occasionally removes the pairing when the Bluetooth connection breaks badly. Re-run the pair wizard: `ios-notifications-pair`
 
-## Limitations
+**Notification text is missing (shows app name only)**
+- On your iPhone: Settings → Notifications → [App] → set **Show Previews** to **Always** (not "When Unlocked")
 
-- **Read-only.** ANCS does not allow replying to iMessages or sending SMS;
-  Apple deliberately omits that capability. To reply, you need an iPhone or
-  Mac.
-- **One paired iPhone at a time.** Multi-device support is a possible
-  future feature.
-- **Linux + KDE Plasma 6 only.** GNOME/XFCE will receive notifications
-  too (any notification daemon listening on
-  `org.freedesktop.Notifications`), but the plasmoid is Plasma-specific.
+**Connection keeps dropping**
+- Make sure your Bluetooth adapter supports BLE: `btmgmt info | grep le`
+- Try toggling Bluetooth off and on on both devices
 
-## Testing
+## Building from source
+
+```bash
+# Install Rust (if needed)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Install system dependencies
+sudo apt install libdbus-1-dev pkg-config   # Ubuntu/Debian
+sudo dnf install dbus-devel pkg-config      # Fedora
+sudo pacman -S dbus pkgconf                 # Arch
+
+# Build and install
+git clone https://github.com/michnaugh1/ios-notifications.git
+cd ios-notifications
+./scripts/install-daemon.sh
+```
+
+Run the tests:
 
 ```bash
 cargo test --workspace
 ```
 
-Manual integration tests (iPhone required): see
-[docs/manual-tests.md](docs/manual-tests.md).
+## Limitations
 
-## Credits
-
-This is a fork-and-evolve of
-[kmod-midori/ancs-linux](https://github.com/kmod-midori/ancs-linux)
-(MIT, © 2024 Midori Kochiya). Upstream provides:
-
-- The ANCS protocol implementation
-- The HID-keyboard auto-reconnect trick (advertising as a fake HID
-  peripheral so iOS auto-reconnects on wake)
-- The GATT plumbing for BlueZ via `bluer`
-
-This fork adds: configuration-driven filtering, systemd integration with
-suspend/resume handling, a D-Bus interface for tray applets, a Plasma 6
-plasmoid, and a one-shot pairing CLI. Protocol-layer fixes are upstreamed.
-
-Also builds on:
-
-- [`ianmarmour/ancs`](https://github.com/ianmarmour/ancs) — ANCS protocol
-  types crate
-- [Apple's ANCS specification](https://developer.apple.com/library/archive/documentation/CoreBluetooth/Reference/AppleNotificationCenterServiceSpecification/Specification/Specification.html)
-- [`bluer`](https://docs.rs/bluer) — Rust BlueZ binding
-- [`zbus`](https://docs.rs/zbus) — Rust D-Bus library
-- [KDE Frameworks 6](https://develop.kde.org/) — for the plasmoid
+- **Read-only.** ANCS does not allow replying to messages — Apple deliberately omits that capability.
+- **One iPhone at a time.** The config holds a single device MAC address.
+- **x86_64 only** for pre-built binaries. ARM support is planned.
 
 ## License
 
