@@ -3,6 +3,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use bluer::Address;
 use clap::Parser;
+use futures::StreamExt as _;
 use tokio::sync::{mpsc, RwLock};
 
 mod ancs;
@@ -103,18 +104,52 @@ async fn main() -> Result<()> {
             e
         })?;
 
-    // Run supervisor
-    supervisor::run_supervisor(
-        config,
-        adapter,
-        device_addr,
-        filter,
-        shared,
-        event_rx,
-        event_tx,
-        iface_ref,
-    )
-    .await?;
+    // Watch for the adapter being powered off (happens when the kernel tears
+    // down the BT controller on deep suspend). If detected, exit so systemd
+    // restarts us — on restart we re-register the HID GATT app and
+    // advertisement with a live adapter instead of stale handles.
+    let adapter_for_watch = adapter.clone();
 
-    Ok(())
+    tokio::select! {
+        res = supervisor::run_supervisor(
+            config,
+            adapter,
+            device_addr,
+            filter,
+            shared,
+            event_rx,
+            event_tx,
+            iface_ref,
+        ) => res,
+
+        () = watch_adapter_powered_off(adapter_for_watch) => {
+            Err(anyhow::anyhow!(
+                "Bluetooth adapter powered off; exiting so systemd can restart with fresh registrations"
+            ))
+        }
+    }
+}
+
+/// Returns when the adapter transitions to powered-off. Used to detect a
+/// kernel-level adapter reset after deep suspend so we can restart cleanly.
+async fn watch_adapter_powered_off(adapter: bluer::Adapter) {
+    match adapter.events().await {
+        Ok(mut events) => {
+            while let Some(evt) = events.next().await {
+                if let bluer::AdapterEvent::PropertyChanged(
+                    bluer::AdapterProperty::Powered(false),
+                ) = evt
+                {
+                    log::warn!("Bluetooth adapter powered off; will exit for systemd restart");
+                    return;
+                }
+            }
+            // Event stream closed — adapter removed entirely.
+            log::warn!("Bluetooth adapter event stream ended; will exit for systemd restart");
+        }
+        Err(e) => {
+            log::warn!("Cannot watch adapter events ({}); adapter reset recovery disabled", e);
+            std::future::pending::<()>().await;
+        }
+    }
 }
