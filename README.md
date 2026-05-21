@@ -21,6 +21,7 @@ Everything runs locally over Bluetooth LE — nothing leaves your home network.
 - **Automatic Reconnect**: Seamlessly picks up notifications when you return to your computer.
 - **App Filtering**: Blacklist or whitelist specific apps via a simple TOML config.
 - **Privacy First**: No cloud, no internet access required, and no third-party iOS app to install.
+- **Audio Isolation**: Automatically disconnects A2DP and HFP/HSP audio profiles on every connect, so your phone's audio and incoming call ringing stay on the iPhone instead of routing through the laptop.
 - **D-Bus Interface**: Real-time state and notification counters accessible via `busctl`.
 
 ## Requirements
@@ -116,6 +117,9 @@ busctl --user call io.github.michnaugh1.IosNotifications \
 
 **Notification text is missing (shows app name only)**
 - On your iPhone: Settings → Notifications → [App] → set **Show Previews** to **Always** (not "When Unlocked")
+
+**Phone audio or call ringing still comes through the laptop**
+- The daemon disconnects audio profiles on each connect. If audio reconnects a few seconds later, your iPhone is re-initiating the connection — go to iPhone Settings → Bluetooth → tap **(i)** next to your computer and check whether it lists your laptop as an audio device. Unpairing and re-running `ios-notifications-pair` resets the profile list.
 
 **Connection keeps dropping**
 - Make sure your Bluetooth adapter supports BLE: `btmgmt info | grep le`

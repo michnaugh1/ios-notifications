@@ -822,7 +822,7 @@ dependencies = [
 
 [[package]]
 name = "ios-notifications-pair"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bluer",
@@ -836,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "ios-notificationsd"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ancs",
  "anyhow",

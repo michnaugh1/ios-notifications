@@ -94,6 +94,8 @@ impl AncsProcessor {
             Err(e) => bail!("connect() failed: {:#}", e),
         }
 
+        disconnect_audio_profiles(&device).await;
+
         // Try the standard path first (ServicesResolved fires quickly on fresh connections).
         // If it takes more than 8s it means BlueZ isn't doing auto-discovery for this
         // connection (common when iOS also has a BR/EDR link in progress). In that case
@@ -385,6 +387,28 @@ impl AncsProcessor {
     }
 }
 
+/// Disconnect BR/EDR audio profiles (A2DP, HFP, HSP) on the given device.
+/// Called after every connect so the phone never routes audio or calls through
+/// the laptop. Errors are ignored — the profile may simply not be connected.
+async fn disconnect_audio_profiles(device: &bluer::Device) {
+    const AUDIO_PROFILE_UUIDS: &[&str] = &[
+        "0000110a-0000-1000-8000-00805f9b34fb", // A2DP Source
+        "0000110b-0000-1000-8000-00805f9b34fb", // A2DP Sink
+        "0000111e-0000-1000-8000-00805f9b34fb", // HFP Hands-Free
+        "0000111f-0000-1000-8000-00805f9b34fb", // HFP Audio Gateway
+        "00001108-0000-1000-8000-00805f9b34fb", // HSP Headset
+        "00001112-0000-1000-8000-00805f9b34fb", // HSP Audio Gateway
+    ];
+    for uuid_str in AUDIO_PROFILE_UUIDS {
+        if let Ok(uuid) = uuid_str.parse::<Uuid>() {
+            match device.disconnect_profile(&uuid).await {
+                Ok(()) => log::info!("Disconnected audio profile {}", uuid_str),
+                Err(e) => log::debug!("Audio profile {} not connected ({})", uuid_str, e),
+            }
+        }
+    }
+}
+
 /// Enumerate GATT services from cached D-Bus objects without waiting for
 /// ServicesResolved. BlueZ persists discovered service objects across connections,
 /// so they're available even when the ServicesResolved flag is false.
@@ -408,7 +432,10 @@ async fn scan_services_from_dbus(device: &bluer::Device) -> Result<Vec<bluer::ga
         .await?;
 
     let xml = proxy.introspect().await?;
-    let node = roxmltree::Document::parse(&xml)?;
+    let node = roxmltree::Document::parse_with_options(
+        &xml,
+        roxmltree::ParsingOptions { allow_dtd: true, ..Default::default() },
+    )?;
 
     for child in node.root_element().children() {
         if child.has_tag_name("node") {

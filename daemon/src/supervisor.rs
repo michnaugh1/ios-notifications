@@ -181,6 +181,7 @@ pub async fn run_supervisor(
     iface_ref: zbus::object_server::InterfaceRef<IosNotificationsIface>,
 ) -> Result<()> {
     let mut sm = StateMachine::new();
+    let mut active_task: Option<tokio::task::JoinHandle<()>> = None;
     let resume_grace = Duration::from_millis(config.supervisor.resume_grace_ms as u64);
 
     // Kick the machine
@@ -207,81 +208,93 @@ pub async fn run_supervisor(
             State::Connecting => {
                 // Attempt one connection in a separate task so we can race
                 // against incoming events (Pause, Reconnect, sleep, etc.).
-                let filter_clone = filter.clone();
-                let event_tx_clone = event_tx.clone();
-                let shared_clone = shared.clone();
-                let adapter_clone = adapter.clone();
-                let on_delivered: Box<dyn Fn(String, String) + Send + Sync> = {
-                    let iface_ref = iface_ref.clone();
-                    let shared = shared.clone();
-                    Box::new(move |app_id, title| {
+                if active_task.is_none() {
+                    let filter_clone = filter.clone();
+                    let event_tx_clone = event_tx.clone();
+                    let shared_clone = shared.clone();
+                    let adapter_clone = adapter.clone();
+                    let on_delivered: Box<dyn Fn(String, String) + Send + Sync> = {
                         let iface_ref = iface_ref.clone();
                         let shared = shared.clone();
-                        tokio::spawn(async move {
-                            shared.write().await.notifications_today += 1;
-                            let emitter = iface_ref.signal_emitter();
-                            let _ = IosNotificationsIface::notification_delivered(
-                                emitter, &app_id, &title,
-                            )
-                            .await;
-                        });
-                    })
-                };
-                let on_filtered: Box<dyn Fn(String, String) + Send + Sync> = {
-                    let iface_ref = iface_ref.clone();
-                    Box::new(move |app_id, title| {
-                        let iface_ref = iface_ref.clone();
-                        tokio::spawn(async move {
-                            let emitter = iface_ref.signal_emitter();
-                            let _ = IosNotificationsIface::notification_filtered(
-                                emitter, &app_id, &title,
-                            )
-                            .await;
-                        });
-                    })
-                };
-                let on_connected: Box<dyn Fn() + Send + Sync> = {
-                    let event_tx = event_tx.clone();
-                    Box::new(move || {
-                        let event_tx = event_tx.clone();
-                        tokio::spawn(async move {
-                            let _ = event_tx.send(Event::ConnectSucceeded).await;
-                        });
-                    })
-                };
-
-                let _attempt = tokio::spawn(async move {
-                    let proc = AncsProcessor::with_callbacks(
-                        shared_clone.clone(),
-                        filter_clone,
-                        on_connected,
-                        on_delivered,
-                        on_filtered,
-                    );
-                    let result = proc.main_loop(device_addr, &adapter_clone).await;
-                    let evt = match &result {
-                        Ok(()) => {
-                            // main_loop returns Ok when DeviceRemoved fires
-                            Event::LinkDropped
-                        }
-                        Err(e) => {
-                            let msg = format!("{:#}", e);
-                            log::warn!("ANCS connection failed: {}", msg);
-                            shared_clone.write().await.last_error = msg.clone();
-                            if msg.contains("ANCS service not found") {
-                                pop_ancs_missing_notification();
-                                Event::AncsMissing
-                            } else {
-                                Event::ConnectFailed
-                            }
-                        }
+                        Box::new(move |app_id, title| {
+                            let iface_ref = iface_ref.clone();
+                            let shared = shared.clone();
+                            tokio::spawn(async move {
+                                shared.write().await.notifications_today += 1;
+                                let emitter = iface_ref.signal_emitter();
+                                let _ = IosNotificationsIface::notification_delivered(
+                                    emitter, &app_id, &title,
+                                )
+                                .await;
+                            });
+                        })
                     };
-                    let _ = event_tx_clone.send(evt).await;
-                });
+                    let on_filtered: Box<dyn Fn(String, String) + Send + Sync> = {
+                        let iface_ref = iface_ref.clone();
+                        Box::new(move |app_id, title| {
+                            let iface_ref = iface_ref.clone();
+                            tokio::spawn(async move {
+                                let emitter = iface_ref.signal_emitter();
+                                let _ = IosNotificationsIface::notification_filtered(
+                                    emitter, &app_id, &title,
+                                )
+                                .await;
+                            });
+                        })
+                    };
+                    let on_connected: Box<dyn Fn() + Send + Sync> = {
+                        let event_tx = event_tx.clone();
+                        Box::new(move || {
+                            let event_tx = event_tx.clone();
+                            tokio::spawn(async move {
+                                let _ = event_tx.send(Event::ConnectSucceeded).await;
+                            });
+                        })
+                    };
+
+                    active_task = Some(tokio::spawn(async move {
+                        let proc = AncsProcessor::with_callbacks(
+                            shared_clone.clone(),
+                            filter_clone,
+                            on_connected,
+                            on_delivered,
+                            on_filtered,
+                        );
+                        let result = proc.main_loop(device_addr, &adapter_clone).await;
+                        let evt = match &result {
+                            Ok(()) => {
+                                // main_loop returns Ok when DeviceRemoved fires
+                                Event::LinkDropped
+                            }
+                            Err(e) => {
+                                let msg = format!("{:#}", e);
+                                log::warn!("ANCS connection failed: {}", msg);
+                                shared_clone.write().await.last_error = msg.clone();
+                                if msg.contains("ANCS service not found") {
+                                    pop_ancs_missing_notification();
+                                    Event::AncsMissing
+                                } else {
+                                    Event::ConnectFailed
+                                }
+                            }
+                        };
+                        let _ = event_tx_clone.send(evt).await;
+                    }));
+                }
 
                 // Wait for events
                 if let Some(evt) = event_rx.recv().await {
+                    let old_state = sm.state();
+                    let is_reconnect = matches!(evt, Event::Reconnect);
                     sm.handle(evt);
+
+                    // If we moved away from Connecting (except to Connected),
+                    // or if we were forced to Reconnect, abort the current task.
+                    if is_reconnect || (sm.state() != old_state && sm.state() != State::Connected) {
+                        if let Some(task) = active_task.take() {
+                            task.abort();
+                        }
+                    }
                 }
             }
 
@@ -296,7 +309,13 @@ pub async fn run_supervisor(
                         sm.handle(Event::BackoffElapsed);
                     }
                     Some(evt) = event_rx.recv() => {
+                        let old_state = sm.state();
                         sm.handle(evt);
+                        if sm.state() != old_state {
+                            if let Some(task) = active_task.take() {
+                                task.abort();
+                            }
+                        }
                     }
                 }
                 shared.write().await.next_backoff_secs = 0;
@@ -308,7 +327,13 @@ pub async fn run_supervisor(
                         sm.handle(Event::ErrorRetry);
                     }
                     Some(evt) = event_rx.recv() => {
+                        let old_state = sm.state();
                         sm.handle(evt);
+                        if sm.state() != old_state {
+                            if let Some(task) = active_task.take() {
+                                task.abort();
+                            }
+                        }
                     }
                 }
             }
@@ -316,11 +341,20 @@ pub async fn run_supervisor(
             State::Paused | State::Connected => {
                 // Wait for an external event
                 if let Some(evt) = event_rx.recv().await {
+                    let old_state = sm.state();
                     // If this was a wake-from-sleep, observe the grace period.
-                    if matches!(&evt, Event::PrepareForSleep(false)) {
+                    let is_wake = matches!(&evt, Event::PrepareForSleep(false));
+                    sm.handle(evt);
+
+                    if is_wake {
                         sleep(resume_grace).await;
                     }
-                    sm.handle(evt);
+
+                    if sm.state() != old_state {
+                        if let Some(task) = active_task.take() {
+                            task.abort();
+                        }
+                    }
                 }
             }
 
