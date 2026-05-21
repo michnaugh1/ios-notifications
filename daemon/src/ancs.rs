@@ -5,7 +5,7 @@
  
 use roxmltree;
 
-use std::{io::Cursor, sync::Arc};
+use std::{collections::HashMap, io::Cursor, sync::Arc, time::Instant};
 
 use ancs::{
     attributes::{
@@ -40,6 +40,9 @@ pub struct AncsProcessor {
     on_connected: Box<dyn Fn() + Send + Sync>,
     on_delivered: Box<dyn Fn(String, String) + Send + Sync>,
     on_filtered: Box<dyn Fn(String, String) + Send + Sync>,
+    // BlueZ delivers each GATT notification twice via D-Bus PropertiesChanged.
+    // Track recently processed UIDs and drop duplicates within 5s.
+    recent_uids: HashMap<u32, Instant>,
 }
 
 impl AncsProcessor {
@@ -71,6 +74,7 @@ impl AncsProcessor {
             on_connected,
             on_delivered,
             on_filtered,
+            recent_uids: HashMap::new(),
         }
     }
 
@@ -244,6 +248,16 @@ impl AncsProcessor {
             return Ok(());
         }
 
+        // BlueZ emits each GATT notification twice via D-Bus PropertiesChanged.
+        // Drop duplicates that arrive within 5 seconds of the first delivery.
+        let now = Instant::now();
+        self.recent_uids.retain(|_, t| now.duration_since(*t).as_secs() < 5);
+        if self.recent_uids.contains_key(&notification_uid) {
+            log::debug!("Dropping duplicate ANCS event uid={}", notification_uid);
+            return Ok(());
+        }
+        self.recent_uids.insert(notification_uid, now);
+
         let cmd = GetNotificationAttributesRequest {
             command_id: CommandID::GetNotificationAttributes,
             notification_uid,
@@ -321,13 +335,20 @@ impl AncsProcessor {
                     if let Some(b) = &current_body {
                         desktop_notification.body(b);
                     }
-                    let handle = desktop_notification.show_async().await?;
-                    log::info!(
-                        "Shown notification {} with desktop handle {}",
-                        notif.notification_uid,
-                        handle.id()
-                    );
-                    (self.on_delivered)(app_id.to_string(), title);
+                    match desktop_notification.show_async().await {
+                        Ok(handle) => {
+                            log::info!(
+                                "Shown notification {} with desktop handle {}",
+                                notif.notification_uid,
+                                handle.id()
+                            );
+                            (self.on_delivered)(app_id.to_string(), title);
+                        }
+                        Err(e) if format!("{e}").contains("ExcessNotification") => {
+                            log::warn!("Notification rate-limited by desktop (uid={}), continuing", notif.notification_uid);
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
                 }
 
                 if let Some(app_id) = app_id_to_query {
