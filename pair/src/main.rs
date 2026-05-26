@@ -63,6 +63,9 @@ async fn run(args: &Args, config_path: &Path) -> Result<()> {
     adapter.set_pairable_timeout(args.timeout).await?;
     adapter.set_discoverable(true).await?;
     adapter.set_discoverable_timeout(args.timeout).await?;
+    // alias() is the user-visible name (e.g. "kubuntu-xps"); name() is the
+    // kernel interface name (e.g. "hci0") which iOS would display verbatim.
+    let display_name = adapter.alias().await?;
     // set_discoverable only covers BR/EDR inquiry; BLE requires an active
     // advertisement. Advertise as a HID keyboard (UUID 0x1812, appearance
     // 0x03C1) so iOS shows this device in Bluetooth Settings → Other Devices.
@@ -71,7 +74,7 @@ async fn run(args: &Args, config_path: &Path) -> Result<()> {
         advertisement_type: AdvType::Peripheral,
         service_uuids: [Uuid::from_u16(0x1812)].into(),
         appearance: Some(0x03C1),
-        local_name: Some(adapter.name().to_string()),
+        local_name: Some(display_name.clone()),
         discoverable: Some(true),
         ..Default::default()
     };
@@ -81,7 +84,7 @@ async fn run(args: &Args, config_path: &Path) -> Result<()> {
 
     println!("\n        ── On your iPhone ──");
     println!("        1. Open Settings → Bluetooth.");
-    println!("        2. Wait for \"{}\" to appear and tap it.", adapter.name());
+    println!("        2. Wait for \"{}\" to appear and tap it.", display_name);
     println!("        3. Confirm the pairing code matches.");
     println!("        4. After pairing, leave the iOS Bluetooth screen OPEN.");
     println!("        5. iOS will ask whether to share notifications — say YES.\n");
