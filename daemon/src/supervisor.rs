@@ -35,6 +35,7 @@ pub enum Event {
     Initialized,
     ConnectSucceeded,
     ConnectFailed,
+    ConnectFailedIosTerminated,
     LinkDropped,
     BackoffElapsed,
     PrepareForSleep(bool), // true = entering sleep, false = waking
@@ -47,6 +48,7 @@ pub enum Event {
 
 const BACKOFF_INITIAL_S: u32 = 2;
 const BACKOFF_MAX_S: u32 = 60;
+const BACKOFF_IOS_TERMINATED_S: u32 = 12;
 
 pub struct StateMachine {
     state: State,
@@ -113,6 +115,14 @@ impl StateMachine {
             (State::Connecting, Event::ConnectSucceeded) => {
                 self.state = State::Connected;
                 self.backoff_secs = BACKOFF_INITIAL_S;
+            }
+            (State::Connecting, Event::ConnectFailedIosTerminated) => {
+                self.backoff_secs = BACKOFF_IOS_TERMINATED_S;
+                self.state = State::Backoff;
+            }
+            (State::Connected, Event::ConnectFailedIosTerminated) => {
+                self.backoff_secs = BACKOFF_IOS_TERMINATED_S;
+                self.state = State::Backoff;
             }
             (State::Connecting, Event::ConnectFailed) => {
                 self.state = State::Backoff;
@@ -613,5 +623,35 @@ mod tests {
         sm.handle(Event::AncsMissing);
         sm.handle(Event::ErrorRetry);
         assert_eq!(sm.state(), State::Connecting);
+    }
+
+    #[test]
+    fn ios_terminated_backoff_is_at_least_12s() {
+        let mut sm = StateMachine::new();
+        sm.handle(Event::Initialized);
+        sm.handle(Event::ConnectSucceeded);
+        sm.handle(Event::ConnectFailedIosTerminated);
+        assert_eq!(sm.state(), State::Backoff);
+        assert_eq!(sm.backoff_secs(), 12);
+    }
+
+    #[test]
+    fn ios_terminated_backoff_from_connecting() {
+        let mut sm = StateMachine::new();
+        sm.handle(Event::Initialized);
+        sm.handle(Event::ConnectFailedIosTerminated);
+        assert_eq!(sm.state(), State::Backoff);
+        assert_eq!(sm.backoff_secs(), 12);
+    }
+
+    #[test]
+    fn ios_terminated_backoff_doubles_on_next_failure() {
+        let mut sm = StateMachine::new();
+        sm.handle(Event::Initialized);
+        sm.handle(Event::ConnectFailedIosTerminated);
+        assert_eq!(sm.backoff_secs(), 12);
+        sm.handle(Event::BackoffElapsed); // → Connecting, doubles backoff to 24
+        sm.handle(Event::ConnectFailed);  // regular failure
+        assert_eq!(sm.backoff_secs(), 24);
     }
 }
