@@ -402,7 +402,15 @@ impl AncsProcessor {
                         ..Default::default()
                     },
                 )
-                .await?;
+                .await
+                .map_err(|e| {
+                    let msg = format!("{:#}", e);
+                    if msg.contains("ATT error: 0x0e") || msg.contains("ATT error: 14") {
+                        anyhow::anyhow!("ancs-session-terminated: {}", msg)
+                    } else {
+                        anyhow::anyhow!("{}", msg)
+                    }
+                })?;
         }
         Ok(())
     }
