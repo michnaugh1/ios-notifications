@@ -283,6 +283,12 @@ pub async fn run_supervisor(
                                 if msg.contains("ANCS service not found") {
                                     pop_ancs_missing_notification();
                                     Event::AncsMissing
+                                } else if msg.contains("ancs-session-terminated") {
+                                    log::warn!("iOS terminated ANCS session — backing off {}s before reconnect", BACKOFF_IOS_TERMINATED_S);
+                                    Event::ConnectFailedIosTerminated
+                                } else if msg.contains("le-connection-abort-by-local") {
+                                    log::warn!("LE connection aborted by local stack — backing off {}s before reconnect", BACKOFF_IOS_TERMINATED_S);
+                                    Event::ConnectFailedIosTerminated
                                 } else {
                                     Event::ConnectFailed
                                 }
