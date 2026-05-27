@@ -48,7 +48,7 @@ pub enum Event {
 
 const BACKOFF_INITIAL_S: u32 = 2;
 const BACKOFF_MAX_S: u32 = 60;
-const BACKOFF_IOS_TERMINATED_S: u32 = 12;
+const BACKOFF_IOS_TERMINATED_S: u32 = 30;
 
 pub struct StateMachine {
     state: State,
@@ -632,13 +632,13 @@ mod tests {
     }
 
     #[test]
-    fn ios_terminated_backoff_is_at_least_12s() {
+    fn ios_terminated_backoff_is_at_least_30s() {
         let mut sm = StateMachine::new();
         sm.handle(Event::Initialized);
         sm.handle(Event::ConnectSucceeded);
         sm.handle(Event::ConnectFailedIosTerminated);
         assert_eq!(sm.state(), State::Backoff);
-        assert_eq!(sm.backoff_secs(), 12);
+        assert_eq!(sm.backoff_secs(), 30);
     }
 
     #[test]
@@ -647,7 +647,7 @@ mod tests {
         sm.handle(Event::Initialized);
         sm.handle(Event::ConnectFailedIosTerminated);
         assert_eq!(sm.state(), State::Backoff);
-        assert_eq!(sm.backoff_secs(), 12);
+        assert_eq!(sm.backoff_secs(), 30);
     }
 
     #[test]
@@ -655,9 +655,9 @@ mod tests {
         let mut sm = StateMachine::new();
         sm.handle(Event::Initialized);
         sm.handle(Event::ConnectFailedIosTerminated);
-        assert_eq!(sm.backoff_secs(), 12);
-        sm.handle(Event::BackoffElapsed); // → Connecting, doubles backoff to 24
+        assert_eq!(sm.backoff_secs(), 30);
+        sm.handle(Event::BackoffElapsed); // → Connecting, doubles backoff to 60
         sm.handle(Event::ConnectFailed);  // regular failure
-        assert_eq!(sm.backoff_secs(), 24);
+        assert_eq!(sm.backoff_secs(), 60);
     }
 }
