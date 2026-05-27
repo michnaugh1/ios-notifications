@@ -43,6 +43,7 @@ pub struct AncsProcessor {
     // BlueZ delivers each GATT notification twice via D-Bus PropertiesChanged.
     // Track recently processed UIDs and drop duplicates within 5s.
     recent_uids: HashMap<u32, Instant>,
+    pending_requests: HashMap<u32, Instant>,
 }
 
 impl AncsProcessor {
@@ -75,6 +76,7 @@ impl AncsProcessor {
             on_delivered,
             on_filtered,
             recent_uids: HashMap::new(),
+            pending_requests: HashMap::new(),
         }
     }
 
@@ -300,6 +302,7 @@ impl AncsProcessor {
             ],
         };
         self.write_control_point(&Vec::from(cmd)).await?;
+        self.pending_requests.insert(notification_uid, Instant::now());
         Ok(())
     }
 
@@ -310,6 +313,7 @@ impl AncsProcessor {
                     Ok((_, app)) => app,
                     Err(e) => bail!("Error parsing notification attributes: {:?}", e),
                 };
+                self.pending_requests.remove(&notif.notification_uid);
                 log::info!("Notif: {:?}", notif);
 
                 let mut app_id_to_query: Option<String> = None;
