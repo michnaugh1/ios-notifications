@@ -257,6 +257,26 @@ impl AncsProcessor {
                     if !device.is_connected().await.unwrap_or(true) {
                         bail!("device disconnected (heartbeat); will reconnect");
                     }
+                    let now = Instant::now();
+                    let stale: Vec<u32> = self.pending_requests
+                        .iter()
+                        .filter_map(|(&uid, &sent_at)| {
+                            if now.duration_since(sent_at).as_secs() >= 10 {
+                                Some(uid)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    for uid in &stale {
+                        log::warn!(
+                            "GetNotificationAttributes for uid={} has no response after 10s — data source may be stale",
+                            uid
+                        );
+                    }
+                    if stale.len() >= 2 {
+                        bail!("data source unresponsive — iOS not responding to GetNotificationAttributes");
+                    }
                 }
                 else => break,
             }
