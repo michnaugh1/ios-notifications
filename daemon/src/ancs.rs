@@ -169,9 +169,40 @@ impl AncsProcessor {
         for char_ref in [&data_source, &notification_source] {
             for desc in char_ref.descriptors().await.unwrap_or_default() {
                 if desc.uuid().await.unwrap_or_default() == cccd_uuid {
-                    match desc.write(&[0x00, 0x00]).await {
-                        Ok(()) => log::info!("CCCD reset to 0x0000 ok"),
-                        Err(e) => log::warn!("CCCD reset failed (BlueZ may suppress it): {}", e),
+                    for attempt in 0u8..3 {
+                        match desc.write(&[0x00, 0x00]).await {
+                            Ok(()) => {
+                                log::info!("CCCD reset to 0x0000 ok (attempt {})", attempt + 1);
+                                break;
+                            }
+                            Err(e) if attempt < 2 => {
+                                log::debug!(
+                                    "CCCD reset attempt {} failed: {}; retrying in 300ms",
+                                    attempt + 1,
+                                    e
+                                );
+                                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                            }
+                            Err(e) => {
+                                log::warn!("CCCD reset failed after 3 attempts: {}", e);
+                            }
+                        }
+                    }
+                    // Always verify: read back the CCCD regardless of whether reset succeeded.
+                    match desc.read().await {
+                        Ok(val) if val.first() == Some(&0x01) => {
+                            log::warn!(
+                                "CCCD readback shows {:02x?} after reset — iOS session may be stale; bailing",
+                                val
+                            );
+                            bail!("CCCD reset ineffective — iOS session may be stale");
+                        }
+                        Ok(val) => {
+                            log::info!("CCCD readback: {:02x?} (ok)", val);
+                        }
+                        Err(e) => {
+                            log::warn!("CCCD readback failed (continuing): {}", e);
+                        }
                     }
                     break;
                 }
